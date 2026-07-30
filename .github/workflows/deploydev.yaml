@@ -1,0 +1,197 @@
+name: Deploy TraceLens Demo to DEV
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: tracelens-log-router-dev-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  FUNCTION_NAME: tracelens-log-router
+  DEPLOYMENT_ROLE_ARN: arn:aws:iam::596871238690:role/GitHubLambdaDevDeploymentRole
+  FUNCTION_FOLDER: functions/tracelens-log-router
+  PACKAGE_NAME: tracelens-log-router.zip
+  SMOKE_TEST_FILE: tests/smoke-tests/tracelens-log-router.json
+
+jobs:
+  deploy-dev:
+    name: Build, Deploy and Test DEV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v6
+
+      - name: Show repository files
+        run: |
+          echo "Repository files:"
+          find . -maxdepth 4 -type f | sort
+
+      - name: Validate Python code
+        run: |
+          python -m compileall "${FUNCTION_FOLDER}"
+
+      - name: Build Lambda ZIP
+        run: |
+          cd "${FUNCTION_FOLDER}"
+          zip -r "../../${PACKAGE_NAME}" .
+          cd ../..
+
+      - name: Show ZIP contents
+        run: |
+          unzip -l "${PACKAGE_NAME}"
+
+      # This step prints the claims AWS receives.
+      # It does not print the complete OIDC token.
+      - name: Show GitHub OIDC claims
+        shell: bash
+        run: |
+          TOKEN_RESPONSE=$(curl --silent --show-error --fail \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+
+          export ID_TOKEN
+          ID_TOKEN=$(echo "${TOKEN_RESPONSE}" | python -c \
+            "import json,sys; print(json.load(sys.stdin)['value'])")
+
+          python - <<'PY'
+          import base64
+          import json
+          import os
+
+          token = os.environ["ID_TOKEN"]
+          payload = token.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+
+          claims = json.loads(
+              base64.urlsafe_b64decode(payload).decode("utf-8")
+          )
+
+          print("OIDC audience:", claims.get("aud"))
+          print("OIDC subject:", claims.get("sub"))
+          print("Repository:", claims.get("repository"))
+          print("Branch reference:", claims.get("ref"))
+          PY
+
+      - name: Authenticate to AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ env.DEPLOYMENT_ROLE_ARN }}
+          role-session-name: github-dev-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Update Lambda latest
+        run: |
+          aws lambda update-function-code \
+            --function-name "${FUNCTION_NAME}" \
+            --zip-file "fileb://${PACKAGE_NAME}" \
+            --region "${AWS_REGION}"
+
+      - name: Wait for Lambda update
+        run: |
+          aws lambda wait function-updated-v2 \
+            --function-name "${FUNCTION_NAME}" \
+            --region "${AWS_REGION}"
+
+      - name: Verify Lambda update
+        run: |
+          aws lambda get-function-configuration \
+            --function-name "${FUNCTION_NAME}" \
+            --region "${AWS_REGION}" \
+            --query '{
+              FunctionName: FunctionName,
+              Version: Version,
+              LastUpdateStatus: LastUpdateStatus,
+              LastModified: LastModified,
+              CodeSha256: CodeSha256
+            }'
+
+      - name: Run DEV smoke test
+        run: |
+          aws lambda invoke \
+            --function-name "${FUNCTION_NAME}" \
+            --qualifier '$LATEST' \
+            --cli-binary-format raw-in-base64-out \
+            --payload "file://${SMOKE_TEST_FILE}" \
+            --region "${AWS_REGION}" \
+            response.json \
+            > invocation.json
+
+          echo "Invocation metadata:"
+          cat invocation.json
+
+          echo ""
+          echo "Lambda response:"
+          cat response.json
+
+      - name: Validate smoke-test response
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+
+          with open("invocation.json", encoding="utf-8") as file:
+              invocation = json.load(file)
+
+          function_error = invocation.get("FunctionError")
+
+          if function_error:
+              print(
+                  f"Lambda returned FunctionError: {function_error}"
+              )
+              sys.exit(1)
+
+          executed_version = invocation.get("ExecutedVersion")
+
+          if executed_version != "$LATEST":
+              print(
+                  f"Expected $LATEST, received {executed_version}"
+              )
+              sys.exit(1)
+
+          with open("response.json", encoding="utf-8") as file:
+              response = json.load(file)
+
+          records = response.get("records")
+
+          if not isinstance(records, list) or not records:
+              print("Expected a non-empty Firehose records list.")
+              sys.exit(1)
+
+          failed_records = [
+              record
+              for record in records
+              if record.get("result") != "Ok"
+          ]
+
+          if failed_records:
+              print("Some Firehose records were not marked Ok.")
+              print(json.dumps(failed_records, indent=2))
+              sys.exit(1)
+
+          missing_data = [
+              record.get("recordId", "<unknown>")
+              for record in records
+              if not record.get("data")
+          ]
+
+          if missing_data:
+              print("Some Firehose records are missing data:", missing_data)
+              sys.exit(1)
+
+          print(f"Smoke test passed for {len(records)} Firehose record(s).")
+          print("Executed version:", executed_version)
+          PY
